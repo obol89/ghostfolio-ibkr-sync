@@ -16,11 +16,19 @@ This project replaces [agusalex/ghostfolio-sync](https://github.com/AgustaRC/gho
 
 This script parses the IBKR XML directly, avoids fragile third-party libraries, and gives you full control over symbol mapping.
 
+## Docker image
+
+```
+ghcr.io/obol89/ghostfolio-ibkr-sync:latest
+```
+
+Multi-arch image (linux/amd64 and linux/arm64). New images are published automatically on every push to main.
+
 ## Prerequisites
 
 - A running self-hosted Ghostfolio instance
 - An Interactive Brokers account with Flex Web Service enabled
-- Docker (for containerized runs) or Python 3.10+ with `requests` and `pyyaml`
+- Docker (for containerised runs) or Python 3.10+ with `requests` and `pyyaml`
 
 ## IBKR Setup
 
@@ -35,9 +43,11 @@ This script parses the IBKR XML directly, avoids fragile third-party libraries, 
 
 ### 2. Create a Flex Query
 
+**Important:** If you have multiple sub-accounts, create one Flex Query per sub-account. See the multi-account section below before creating your queries.
+
 1. On the same Flex Queries page, click **Create** under **Activity Flex Query**
-2. Give it a name like `Ghostfolio Sync`
-3. Set the period to **Last 365 Calendar Days** (or whatever range you want)
+2. Give it a name like `Ghostfolio Sync - Individual`
+3. Set the period to **Last 365 Calendar Days**
 4. Select the following sections and fields:
 
 **Account Information:**
@@ -49,9 +59,13 @@ This script parses the IBKR XML directly, avoids fragile third-party libraries, 
 - EndingCash
 
 **Trades (Execution):**
+
+Do not use "Select All" for the Trades section. IBKR adds new fields over time that can break XML parsing. Select only these fields individually:
+
 - ClientAccountID
 - CurrencyPrimary
 - AssetClass
+- SubCategory
 - Symbol
 - Description
 - ISIN
@@ -82,11 +96,20 @@ This script parses the IBKR XML directly, avoids fragile third-party libraries, 
 - Code
 
 5. Under **General Configuration**, set **Include Currency Rates** to **No**
-6. Save the query
+
+   This is required. With currency rates enabled, IBKR sends non-standard currency codes (for example `RUS` instead of `RUB`) that break parsing.
+
+6. Save the query and note the Query ID (click the info icon next to the query to find it)
 
 ### 3. Multi-account setup
 
-If you have multiple IBKR sub-accounts (e.g. individual and joint), you must create **one Flex Query per sub-account**. When creating each query, make sure only that specific account is selected in the account filter.
+If you have multiple IBKR sub-accounts (for example individual and joint):
+
+- Create **one Flex Query per sub-account**, with only that sub-account selected in the account filter
+- Run **one container per sub-account** - do not combine multiple accounts into one Flex Query
+- **Exclude paper trading or management accounts** that have no positions - these will cause errors
+
+The tool processes each IBKR account independently and syncs it to a matching Ghostfolio account.
 
 ### 4. Find the Query ID
 
@@ -106,7 +129,7 @@ curl -X POST http://localhost:3333/api/v1/auth/anonymous \
   -d '{"accessToken": "YOUR_GHOSTFOLIO_ACCESS_TOKEN"}'
 ```
 
-The response contains an `authToken` field. Use this as `GHOST_TOKEN`. Note that this token expires, so you may need to regenerate it periodically. For long-running setups, consider using a security token that does not expire.
+The response contains an `authToken` field. Use this as `GHOST_TOKEN`. This token expires and will need to be regenerated periodically.
 
 ### 2. Create an IBKR Platform
 
@@ -129,7 +152,7 @@ Look for the `id` field of the IBKR platform entry. Use this as `GHOST_PLATFORM_
 Create one Ghostfolio account per IBKR sub-account:
 
 1. Go to **Accounts** and click **Add Account**
-2. Set the name to match what you will use in `GHOST_ACCOUNT_NAMES` (e.g. `IBKR Individual`, `IBKR Joint`)
+2. Set the name to match what you will use in `GHOST_ACCOUNT_NAMES` (for example `IBKR Individual` or `IBKR Joint`)
 3. Select the IBKR platform you created
 4. Set the currency to match the sub-account base currency
 5. Repeat for each sub-account
@@ -139,12 +162,12 @@ Create one Ghostfolio account per IBKR sub-account:
 If your IBKR trades involve currencies that are not yet in Ghostfolio:
 
 1. Go to **Admin** - **Market Data**
-2. Search for and add any missing currency pairs (e.g. `USDEUR`, `USDGBP`)
+2. Search for and add any missing currency pairs (for example `USDEUR`, `USDGBP`, `USDCHF`)
 3. Ghostfolio needs these to convert values to your base currency
 
-### 5. After importing
+### 5. After your first import
 
-After your first import, go to **Admin** and click **Gather All Data**. This fetches historical prices from Yahoo Finance for all newly imported symbols. You may need to run this multiple times if you have many new symbols.
+After the first sync, go to **Admin** - **Market Data** and click **Gather All Data**. This fetches historical prices from Yahoo Finance for all newly imported symbols. Without this step, portfolio values and performance charts will be incorrect. Run it again after adding symbols from a new import.
 
 ## Configuration
 
@@ -153,54 +176,77 @@ All configuration is done via environment variables:
 | Variable | Required | Description | Example |
 |---|---|---|---|
 | `IBKR_TOKEN` | Yes | IBKR Flex Web Service token | `1234567890abcdef` |
-| `IBKR_ACCOUNT_IDS` | Yes | Comma-separated IBKR account IDs | `U1234567` or `U1234567,U7654321` |
-| `IBKR_QUERY_IDS` | Yes | Comma-separated Flex Query IDs (one per account) | `123456` or `123456,654321` |
+| `IBKR_ACCOUNT_IDS` | Yes | Comma-separated IBKR account IDs | `U1234567` |
+| `IBKR_QUERY_IDS` | Yes | Comma-separated Flex Query IDs (one per account) | `123456` |
 | `GHOST_TOKEN` | Yes | Ghostfolio auth bearer token | `eyJhbGciOi...` |
-| `GHOST_HOST` | Yes | Ghostfolio base URL | `http://localhost:3333` |
+| `GHOST_HOST` | Yes | Ghostfolio base URL | `http://ghostfolio:3333` |
 | `GHOST_CURRENCY` | No | Default currency (default: `USD`) | `EUR` |
 | `GHOST_PLATFORM_ID` | No | Platform ID for IBKR in Ghostfolio | `abc123-def456` |
-| `GHOST_ACCOUNT_NAMES` | No | Comma-separated Ghostfolio account names (must match account count) | `IBKR Individual,IBKR Joint` |
+| `GHOST_ACCOUNT_NAMES` | No | Comma-separated Ghostfolio account names (must match account count) | `IBKR Individual` |
 | `MAPPING_FILE` | No | Path to symbol mapping YAML (default: `mapping.yaml`) | `/app/mapping.yaml` |
 | `CRON` | No | Cron schedule for recurring runs (Docker only) | `0 6 * * *` |
+| `TZ` | No | Timezone for cron scheduling | `Europe/Warsaw` |
 
 ## Mapping File
 
-The mapping file is a YAML file that maps ISINs to Yahoo Finance ticker symbols. This is necessary because IBKR uses ISINs while Ghostfolio relies on Yahoo Finance for market data.
+The mapping file maps ISINs to Yahoo Finance ticker symbols. This is necessary because IBKR identifies securities by ISIN while Ghostfolio uses Yahoo Finance tickers for price data.
 
 ### Format
 
+The file must have a `symbol_mapping` key at the top level:
+
 ```yaml
 symbol_mapping:
-  US78462F1030: SPY        # SPDR S&P 500 ETF Trust
-  IE00B4L5Y983: IWDA.AS    # iShares Core MSCI World
-  DE0002635307: EXSA.DE    # iShares STOXX Europe 600
-  US0378331005: AAPL        # Apple Inc
-  IE00BKM4GZ66: EMIM.AS    # iShares Core MSCI EM IMI
+  IE00B52MJD48: EIMI.L        # iShares MSCI EM IMI - London
+  DE0002635307: EXSA.DE       # iShares STOXX Europe 600 - Frankfurt
+  IE00B4L5Y983: IWDA.AS       # iShares Core MSCI World - Amsterdam
+  CH0110869143: CHSPI.SW      # iShares Core SPI - Swiss Exchange
 ```
 
-### How to look up Yahoo Finance tickers
+### Which symbols need mapping
+
+US-listed securities (VOO, QQQ, NVDA, AAPL, etc.) are recognised by Yahoo Finance using the IBKR symbol directly, so they do not need an explicit mapping.
+
+European ETFs and stocks require mapping because Yahoo Finance uses exchange suffixes that differ from IBKR symbols:
+
+| Exchange | Suffix | Example |
+|---|---|---|
+| London Stock Exchange | `.L` | `EIMI.L` |
+| Frankfurt / Xetra | `.DE` | `EXSA.DE` |
+| Amsterdam | `.AS` | `IWDA.AS` |
+| SIX Swiss Exchange | `.SW` | `CHSPI.SW` |
+
+### Finding Yahoo Finance tickers
 
 1. Go to [finance.yahoo.com](https://finance.yahoo.com)
-2. Search for the security by name, ISIN, or IBKR symbol
-3. Use the ticker shown on the Yahoo Finance page
-4. For European ETFs, make sure to use the correct exchange suffix (e.g. `.AS` for Amsterdam, `.DE` for Frankfurt, `.L` for London)
+2. Search for the security by name or ISIN
+3. Use the ticker shown on the Yahoo Finance page, including the exchange suffix
 
 ### Unmapped ISINs
 
-When the script encounters an ISIN not in the mapping file, it falls back to using the IBKR symbol. At the end of each run, it prints a summary of all unmapped ISINs in a format you can copy-paste directly into your mapping file:
+When the script encounters an ISIN not in the mapping file, it falls back to the IBKR symbol. At the end of each run, it prints all unmapped ISINs in a format you can copy-paste directly into your mapping file:
 
 ```
 Unmapped ISINs found. Add to your mapping file under symbol_mapping:
 
-  US78462F1030: ???  # IBKR symbol: SPY, description: SPDR S&P 500 ETF TRUST
   DE0002635307: ???  # IBKR symbol: EXSA, description: ISHARES STOXX EU 600
+  IE00B52MJD48: ???  # IBKR symbol: EIMI, description: ISHARES MSCI EM IMI
 ```
 
-Replace `???` with the correct Yahoo Finance ticker and add the lines to your mapping file.
+Replace `???` with the correct Yahoo Finance ticker.
+
+## What the tool skips automatically
+
+- **FX conversion trades** - trades with assetCategory `CASH` are currency conversions, not investment positions
+- **Options trades** - trades with assetCategory `OPT` are skipped (Ghostfolio does not support options)
+- **Orphaned closing trades** - if a symbol has only sell/close trades in the 365-day window with no corresponding buys, all trades for that symbol are skipped. This means the original buy predates the query period and importing the sell would create a phantom short position.
+- **Net negative positions** - if the net quantity across all trades for a symbol is negative (more sold than bought in the window), all trades for that symbol are skipped for the same reason. This catches cases where IBKR uses different symbol variants for the same ISIN.
+- **Dividends for filtered symbols** - if trades for a symbol are skipped for either of the above reasons, dividend entries for that symbol are also skipped, matched by both symbol name and ISIN to handle IBKR symbol variants.
+- **Duplicate activities** - the tool checks existing Ghostfolio activities before importing and skips anything already present.
 
 ## Running
 
-### Single account
+### Single account (one-off run)
 
 ```bash
 docker run --rm \
@@ -211,21 +257,7 @@ docker run --rm \
   -e GHOST_HOST=http://ghostfolio:3333 \
   -e GHOST_ACCOUNT_NAMES="IBKR Main" \
   -v ./mapping.yaml:/app/mapping.yaml \
-  ghostfolio-ibkr-sync
-```
-
-### Multiple accounts
-
-```bash
-docker run --rm \
-  -e IBKR_TOKEN=your_token \
-  -e IBKR_ACCOUNT_IDS=U1234567,U7654321 \
-  -e IBKR_QUERY_IDS=123456,654321 \
-  -e GHOST_TOKEN=your_ghost_token \
-  -e GHOST_HOST=http://ghostfolio:3333 \
-  -e GHOST_ACCOUNT_NAMES="IBKR Individual,IBKR Joint" \
-  -v ./mapping.yaml:/app/mapping.yaml \
-  ghostfolio-ibkr-sync
+  ghcr.io/obol89/ghostfolio-ibkr-sync:latest
 ```
 
 ### Without Docker
@@ -243,23 +275,47 @@ python ibkr_to_ghostfolio.py
 
 ## Docker Compose / Portainer
 
-For scheduled runs, use the `CRON` environment variable. The container uses [supercronic](https://github.com/aptible/supercronic) to run the script on a cron schedule.
+For scheduled runs with multiple sub-accounts, run a separate container per account with staggered cron times. The `CRON` environment variable uses [supercronic](https://github.com/aptible/supercronic) internally.
 
 ```yaml
 services:
-  ibkr-sync:
-    build: .
-    container_name: ghostfolio-ibkr-sync
+  ibkr-sync-individual:
+    image: ghcr.io/obol89/ghostfolio-ibkr-sync:latest
+    container_name: ghostfolio-ibkr-sync-individual
     restart: unless-stopped
+    depends_on:
+      - ghostfolio
     environment:
+      TZ: Europe/Warsaw
       IBKR_TOKEN: your_token
-      IBKR_ACCOUNT_IDS: U1234567,U7654321
-      IBKR_QUERY_IDS: 123456,654321
+      IBKR_ACCOUNT_IDS: U1234567
+      IBKR_QUERY_IDS: 123456
       GHOST_TOKEN: your_ghost_token
       GHOST_HOST: http://ghostfolio:3333
-      GHOST_ACCOUNT_NAMES: "IBKR Individual,IBKR Joint"
+      GHOST_ACCOUNT_NAMES: "IBKR Individual"
       MAPPING_FILE: /app/mapping.yaml
-      CRON: "0 6 * * *"  # Run daily at 6 AM
+      CRON: "0 6 * * *"
+    volumes:
+      - ./mapping.yaml:/app/mapping.yaml
+    networks:
+      - ghostfolio
+
+  ibkr-sync-joint:
+    image: ghcr.io/obol89/ghostfolio-ibkr-sync:latest
+    container_name: ghostfolio-ibkr-sync-joint
+    restart: unless-stopped
+    depends_on:
+      - ghostfolio
+    environment:
+      TZ: Europe/Warsaw
+      IBKR_TOKEN: your_token
+      IBKR_ACCOUNT_IDS: U7654321
+      IBKR_QUERY_IDS: 654321
+      GHOST_TOKEN: your_ghost_token
+      GHOST_HOST: http://ghostfolio:3333
+      GHOST_ACCOUNT_NAMES: "IBKR Joint"
+      MAPPING_FILE: /app/mapping.yaml
+      CRON: "5 6 * * *"
     volumes:
       - ./mapping.yaml:/app/mapping.yaml
     networks:
@@ -270,48 +326,63 @@ networks:
     external: true
 ```
 
-In Portainer, you can paste this as a stack definition and deploy it directly. Make sure the `ghostfolio` network matches the network your Ghostfolio instance is on.
+Use `http://ghostfolio:3333` (internal Docker network hostname) rather than an external IP or localhost. Stagger the cron times by a few minutes so the two containers do not run simultaneously.
+
+In Portainer, paste this as a stack definition and deploy it directly. Make sure the `ghostfolio` network name matches the network your Ghostfolio instance is on.
 
 ## Troubleshooting
 
-### ISIN mapping failures
+### "positionActionID" or unknown field errors on import
 
-If trades show up with wrong tickers or fail to import, check your `mapping.yaml`. The unmapped ISIN summary at the end of each run tells you exactly which ISINs need entries. Use Yahoo Finance to look up the correct ticker.
+You used "Select All" for the Trades section in your Flex Query. IBKR adds new fields periodically and some of them confuse the parser. Delete the query and recreate it, selecting only the individual fields listed in the setup section.
 
-### Missing exchange rates
+### "Unknown currency RUS" or similar invalid currency codes
 
-If Ghostfolio shows incorrect values or missing data, you likely need to add currency pairs. Go to **Admin** - **Market Data** and add the relevant pairs (e.g. `USDEUR`). Then run **Gather All Data**.
+You have **Include Currency Rates** enabled in your Flex Query's General Configuration. Set it to **No** and re-run.
+
+### "AccountInformation NoneType" or account has no data
+
+The IBKR account ID you specified has no activity (often a paper trading or master management account). Exclude it from `IBKR_ACCOUNT_IDS` and `IBKR_QUERY_IDS`.
+
+### "not valid for the specified data source YAHOO"
+
+An imported symbol is not recognised by Yahoo Finance. Check the unmapped ISINs output at the end of the run and add the correct Yahoo Finance ticker to your mapping file. European ETFs almost always need an explicit mapping with an exchange suffix.
+
+### Import fails but activities were expected
+
+The tool logs the error and continues to update the cash balance rather than crashing. Fix the failing symbol in your mapping file and re-run - duplicate detection will skip already-imported activities.
+
+### Portfolio values are wrong after sync
+
+Run **Gather All Data** in Ghostfolio **Admin** - **Market Data**. This fetches historical prices for all symbols. Without this step, performance charts and current values will be missing or incorrect. You may need to also check that all required currency pairs are present in **Market Data**.
+
+### Negative positions appearing in Ghostfolio
+
+This happens when a sell trade is imported without its corresponding buy. The tool filters these automatically using orphaned closing trade detection and net negative position detection. If you still see negative positions, they were likely imported before this filtering was in place - delete them manually in Ghostfolio.
+
+### IBKR symbol variants (for example CSNKYz vs CSNKY)
+
+IBKR sometimes appends a suffix to symbol names for certain listings. The tool filters by both symbol name and ISIN, so variants of the same security are handled together.
 
 ### Token expiry
 
-The IBKR Flex Web Service token expires based on the expiry you set when generating it. If the script starts failing with authentication errors, generate a new token in IBKR Account Management.
+The IBKR Flex Web Service token expires based on the expiry you set when generating it. Set a calendar reminder before it expires. If the script starts failing with authentication errors, generate a new token in IBKR Account Management.
 
-The Ghostfolio auth token also expires. Regenerate it using the curl command in the Ghostfolio Setup section.
+The Ghostfolio auth token also expires. Regenerate it using the curl command in the Ghostfolio Setup section and update your container environment variable.
 
 ### Options trades being skipped
 
-This is intentional. Options (assetCategory `OPT`) are skipped because Ghostfolio does not support options as an asset class. The script logs when it skips these trades.
+This is intentional. Options (`OPT`) are skipped because Ghostfolio does not support them as an asset class.
 
 ### FX conversions being skipped
 
-Trades with assetCategory `CASH` are FX conversions, not actual investment trades. These are skipped intentionally.
-
-### Values not matching between IBKR and Ghostfolio
-
-1. Run **Gather All Data** in Ghostfolio Admin to fetch latest prices
-2. Check that all required currency pairs are added in Admin - Market Data
-3. Verify that your mapping file has the correct Yahoo Finance tickers (some European securities have multiple listings with different prices)
-4. Note that Ghostfolio uses end-of-day prices from Yahoo Finance, which may differ slightly from IBKR execution prices
-
-### Flex Query returns no data
-
-- Make sure you selected the correct date range in the Flex Query configuration
-- Activity Statement data updates once daily after market close
-- If you just opened a new account, there may be no trade history yet
+Also intentional. Trades with assetCategory `CASH` are FX conversion transactions, not investment positions.
 
 ## Limitations
 
-- **No options support** - Ghostfolio does not support options as an asset class, so options trades are skipped entirely
-- **Yahoo Finance data quality** - Ghostfolio relies on Yahoo Finance for price data, which can have gaps, delays, or incorrect data for some securities (especially smaller or non-US listings)
-- **Daily data only** - IBKR Flex Query Activity Statements update once daily after market close, so this tool cannot sync intraday trades in real time
-- **Token management** - Both the IBKR and Ghostfolio tokens expire and need manual renewal
+- **No options support** - Ghostfolio does not support options as an asset class; options trades are skipped entirely
+- **365-day window** - IBKR Flex Query maximum period is 365 days. Positions opened before that window will not be imported. Fully closed positions older than 365 days are also not imported - this is expected behaviour, not a bug.
+- **Yahoo Finance data quality** - price data can have gaps, delays, or missing metadata (sector, country) for non-US ETFs and smaller listings
+- **Daily data only** - Activity Statements update once daily after market close; intraday syncing is not possible
+- **Token management** - both the IBKR Flex token and the Ghostfolio auth token expire and require manual renewal. Set a recurring calendar reminder for the IBKR token (up to 1 year).
+- **One container per account** - running multiple sub-accounts requires multiple containers with separate Flex Queries
