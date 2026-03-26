@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import requests
@@ -98,7 +99,7 @@ def resolve_symbol(isin, ibkr_symbol, mapping):
 # IBKR Flex Query fetching
 # ---------------------------------------------------------------------------
 
-def fetch_flex_report(token, query_id, max_retries=10, retry_delay=10):
+def fetch_flex_report(token, query_id, max_retries=10, retry_delay=5):
     """Fetch a Flex Query report from IBKR (two-step process)."""
     log.info("Requesting Flex Query %s from IBKR...", query_id)
 
@@ -123,18 +124,24 @@ def fetch_flex_report(token, query_id, max_retries=10, retry_delay=10):
                             timeout=60)
         resp.raise_for_status()
 
-        # IBKR returns XML even when the report is not yet ready
-        if resp.text.strip().startswith("<FlexQueryResponse"):
-            check = ET.fromstring(resp.text)
-            if check.findtext("Status") != "Success":
-                log.info("Statement not ready yet (attempt %d/%d), waiting %ds...",
-                         attempt, max_retries, retry_delay)
-                time.sleep(retry_delay)
-                continue
+        root = ET.fromstring(resp.text)
+        status = root.findtext("Status")
+        error_code = root.findtext("ErrorCode")
 
-        # We have the actual report
-        log.info("Flex Query statement received")
-        return resp.text
+        # ErrorCode 1019 means statement generation is still in progress
+        if status == "Warn" or error_code == "1019":
+            log.info("Statement not ready yet (attempt %d/%d), waiting %ds...",
+                     attempt, max_retries, retry_delay)
+            time.sleep(retry_delay)
+            continue
+
+        # Report is ready when Status is absent or FlexStatements are present
+        if status is None or root.find("FlexStatements") is not None:
+            log.info("Flex Query statement received")
+            return resp.text
+
+        error_msg = root.findtext("ErrorMessage", "unknown error")
+        raise RuntimeError(f"IBKR GetStatement failed: {error_msg}")
 
     raise RuntimeError("Timed out waiting for IBKR Flex Query statement")
 
@@ -144,36 +151,43 @@ def fetch_flex_report(token, query_id, max_retries=10, retry_delay=10):
 # ---------------------------------------------------------------------------
 
 def parse_trades(xml_text):
-    """Parse Trade elements from the Flex Query XML."""
+    """Parse Trade elements from the Flex Query XML.
+
+    Structure: FlexQueryResponse > FlexStatements > FlexStatement > Trades > Trade
+    Skips AssetSummary and other non-Trade children of Trades elements.
+    """
     root = ET.fromstring(xml_text)
     trades = []
-    for trade_el in root.iter("Trade"):
-        trades.append(dict(trade_el.attrib))
+    for trades_el in root.iter("Trades"):
+        for child in trades_el:
+            if child.tag == "Trade":
+                trades.append(dict(child.attrib))
     return trades
 
 
 def parse_cash_report(xml_text):
-    """Parse CashReport entries from the Flex Query XML.
+    """Return the ending cash balance in base currency from a Flex Query XML.
 
-    Returns a dict mapping currency to ending cash balance.
-    Only includes entries where the currency is not BASE_SUMMARY.
+    Structure: FlexQueryResponse > FlexStatements > FlexStatement > CashReport > CashReportCurrency
+    Uses the entry where currency="BASE_SUMMARY", which holds the total in base currency.
+    Returns a float, or None if the entry is absent or unparseable.
     """
     root = ET.fromstring(xml_text)
-    balances = {}
     for entry in root.iter("CashReportCurrency"):
-        currency = entry.attrib.get("currency", "")
-        ending_cash = entry.attrib.get("endingCash", "")
-        if currency and currency != "BASE_SUMMARY" and ending_cash:
-            try:
-                balances[currency] = float(ending_cash)
-            except ValueError:
-                pass
-    return balances
+        if entry.attrib.get("currency") == "BASE_SUMMARY":
+            ending_cash = entry.attrib.get("endingCash", "")
+            if ending_cash:
+                try:
+                    return float(ending_cash)
+                except ValueError:
+                    pass
+    return None
 
 
 def parse_dividends(xml_text):
     """Parse ChangeInDividendAccrual elements from the Flex Query XML.
 
+    Structure: FlexQueryResponse > FlexStatements > FlexStatement > ChangeInDividendAccruals > ChangeInDividendAccrual
     Only returns entries where the code attribute contains "Re" (realized).
     Entries with code "Pr" (pending/reversal) are skipped.
     """
@@ -184,14 +198,6 @@ def parse_dividends(xml_text):
         if "Re" in code:
             dividends.append(dict(el.attrib))
     return dividends
-
-
-def parse_base_currency(xml_text):
-    """Extract the base currency from AccountInformation."""
-    root = ET.fromstring(xml_text)
-    for info in root.iter("AccountInformation"):
-        return info.attrib.get("currency", "USD")
-    return "USD"
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +222,8 @@ def ghost_get_accounts(config):
 
 def ghost_find_account_id(config, account_name):
     """Find a Ghostfolio account ID by name."""
-    accounts = ghost_get_accounts(config)
+    data = ghost_get_accounts(config)
+    accounts = data.get("accounts", data) if isinstance(data, dict) else data
     for acc in accounts:
         if acc.get("name") == account_name:
             return acc["id"]
@@ -260,21 +267,28 @@ def ghost_import_activities(config, activities):
                          json=payload, timeout=60)
     if resp.status_code >= 400:
         log.error("Import failed (%d): %s", resp.status_code, resp.text)
-        resp.raise_for_status()
+        log.error("Check your mapping file - a symbol may not be recognised by Ghostfolio")
+        return
     log.info("Successfully imported %d activities", len(activities))
 
 
 def ghost_update_cash_balance(config, account_id, balance):
     """Update the cash balance on a Ghostfolio account."""
     url = f"{config['ghost_host']}/api/v1/account/{account_id}"
-    # First fetch current account to preserve existing fields
     resp = requests.get(url, headers=ghost_headers(config["ghost_token"]), timeout=30)
     resp.raise_for_status()
     account_data = resp.json()
 
-    account_data["balance"] = balance
+    payload = {
+        "balance": balance,
+        "currency": account_data["currency"],
+        "id": account_id,
+        "isExcluded": account_data.get("isExcluded", False),
+        "name": account_data["name"],
+        "platformId": account_data.get("platformId") or config.get("ghost_platform_id") or None,
+    }
     resp = requests.put(url, headers=ghost_headers(config["ghost_token"]),
-                        json=account_data, timeout=30)
+                        json=payload, timeout=30)
     if resp.status_code >= 400:
         log.error("Failed to update cash balance (%d): %s", resp.status_code, resp.text)
     else:
@@ -308,10 +322,13 @@ def convert_trade_to_activity(trade, ghost_account_id, mapping, unmapped):
     date_time = trade.get("dateTime", "")
 
     symbol = resolve_symbol(isin, ibkr_symbol, mapping)
-    if isin and isin not in mapping:
-        unmapped[isin] = {"symbol": ibkr_symbol, "description": description}
-
-    if not symbol:
+    if isin and isin in mapping:
+        log.debug("Trade %s: ISIN %s resolved via mapping -> %s", trade_id, isin, symbol)
+    elif symbol:
+        log.debug("Trade %s: ISIN %s resolved via symbol fallback -> %s", trade_id, isin or "(none)", symbol)
+        if isin:
+            unmapped[isin] = {"symbol": ibkr_symbol, "description": description}
+    else:
         log.warning("No symbol resolved for trade %s (ISIN: %s), skipping", trade_id, isin)
         return None
 
@@ -371,10 +388,13 @@ def convert_dividend_to_activity(dividend, ghost_account_id, mapping, unmapped):
     fee = dividend.get("fee", "0")
 
     symbol = resolve_symbol(isin, ibkr_symbol, mapping)
-    if isin and isin not in mapping:
-        unmapped[isin] = {"symbol": ibkr_symbol, "description": ""}
-
-    if not symbol:
+    if isin and isin in mapping:
+        log.debug("Dividend %s: ISIN %s resolved via mapping -> %s", ibkr_symbol, isin, symbol)
+    elif symbol:
+        log.debug("Dividend %s: ISIN %s resolved via symbol fallback -> %s", ibkr_symbol, isin or "(none)", symbol)
+        if isin:
+            unmapped[isin] = {"symbol": ibkr_symbol, "description": ""}
+    else:
         log.warning("No symbol resolved for dividend (ISIN: %s), skipping", isin)
         return None
 
@@ -436,6 +456,128 @@ def parse_ibkr_datetime(dt_str):
 
 
 # ---------------------------------------------------------------------------
+# Trade filtering
+# ---------------------------------------------------------------------------
+
+def filter_orphaned_closing_trades(trades):
+    """Remove trades for symbols that have closing trades but no opening trades.
+
+    IBKR Flex Query covers at most 365 days. A position bought before that
+    window but sold within it produces only closing ("C") trades in the export.
+    Importing those sells without the corresponding buys would create phantom
+    short positions in Ghostfolio.
+
+    Rules:
+    - Symbol has only "C" trades  → skip all (orphaned closes, buy predates window)
+    - Symbol has both "O" and "C" → keep all (round-trip captured in full)
+    - Symbol has only "O" trades  → keep all (currently open position)
+
+    Trades without an openCloseIndicator are kept unconditionally.
+
+    Returns (filtered_trades, orphaned_symbols, orphaned_isins, dropped_count).
+    """
+    # Group trade indices by symbol, tracking which indicators appear
+    symbol_info = defaultdict(lambda: {"has_open": False, "has_close": False, "isin": ""})
+    for trade in trades:
+        indicator = trade.get("openCloseIndicator", "")
+        symbol = trade.get("symbol", "")
+        if not symbol or not indicator:
+            continue
+        if indicator == "O":
+            symbol_info[symbol]["has_open"] = True
+        elif indicator == "C":
+            symbol_info[symbol]["has_close"] = True
+        if not symbol_info[symbol]["isin"]:
+            symbol_info[symbol]["isin"] = trade.get("isin", "")
+
+    orphaned_symbols = {
+        sym for sym, info in symbol_info.items()
+        if info["has_close"] and not info["has_open"]
+    }
+    orphaned_isins = {
+        symbol_info[sym]["isin"]
+        for sym in orphaned_symbols
+        if symbol_info[sym]["isin"]
+    }
+
+    for sym in sorted(orphaned_symbols):
+        isin = symbol_info[sym]["isin"]
+        log.warning(
+            "Skipping %s (%s) - has closing trades but no opening trades in the "
+            "365-day window. These are fully closed positions where the buy "
+            "predates the query period.",
+            sym, isin or "no ISIN",
+        )
+
+    filtered = [
+        t for t in trades
+        if t.get("symbol", "") not in orphaned_symbols
+        and t.get("isin", "") not in orphaned_isins
+    ]
+    dropped = len(trades) - len(filtered)
+    return filtered, orphaned_symbols, orphaned_isins, dropped
+
+
+def filter_net_negative_positions(trades):
+    """Remove trades for symbols whose net quantity across the window is negative.
+
+    A net negative position means more shares were sold than bought within the
+    365-day query period, which implies the original buy predates the window.
+    Importing such trades would create a phantom short position in Ghostfolio.
+
+    Grouping is by ISIN so that symbol variants (e.g. "CSNKY" / "CSNKYz")
+    for the same security are treated as one position.  Falls back to symbol
+    when ISIN is absent.
+
+    IBKR encodes quantity as positive for buys and negative for sells, so
+    net = sum(quantity) across all trades for the group.
+
+    Returns (filtered_trades, negative_symbols, negative_isins, dropped_count).
+    """
+    # key → canonical symbol / isin for logging, net qty, all symbol variants
+    group_info = defaultdict(lambda: {"symbol": "", "isin": "", "net_qty": 0.0, "symbols": set()})
+    for trade in trades:
+        symbol = trade.get("symbol", "")
+        isin = trade.get("isin", "")
+        key = isin if isin else symbol
+        if not key:
+            continue
+        try:
+            qty = float(trade.get("quantity", "0"))
+        except ValueError:
+            qty = 0.0
+        group_info[key]["net_qty"] += qty
+        group_info[key]["symbols"].add(symbol)
+        if not group_info[key]["isin"]:
+            group_info[key]["isin"] = isin
+        if not group_info[key]["symbol"]:
+            group_info[key]["symbol"] = symbol
+
+    negative_keys = {key for key, info in group_info.items() if info["net_qty"] < 0}
+
+    negative_symbols = set()
+    negative_isins = set()
+    for key in sorted(negative_keys):
+        info = group_info[key]
+        negative_symbols.update(info["symbols"])
+        if info["isin"]:
+            negative_isins.add(info["isin"])
+        log.warning(
+            "Skipping %s (%s) - net position is negative (%.4g shares). "
+            "The original buy predates the 365-day query window.",
+            info["symbol"], info["isin"] or "no ISIN", info["net_qty"],
+        )
+
+    filtered = [
+        t for t in trades
+        if t.get("symbol", "") not in negative_symbols
+        and t.get("isin", "") not in negative_isins
+    ]
+    dropped = len(trades) - len(filtered)
+    return filtered, negative_symbols, negative_isins, dropped
+
+
+# ---------------------------------------------------------------------------
 # Main sync logic
 # ---------------------------------------------------------------------------
 
@@ -458,6 +600,21 @@ def process_account(config, ibkr_account_id, query_id, ghost_account_name, mappi
     dividends = parse_dividends(xml_text)
     log.info("Found %d trades and %d dividend entries in Flex Query report",
              len(trades), len(dividends))
+
+    # Drop orphaned closing trades (buy predates the 365-day query window)
+    trades, orphaned_symbols, orphaned_isins, dropped_orphans = filter_orphaned_closing_trades(trades)
+    if dropped_orphans:
+        log.info("Dropped %d orphaned closing trade(s) with no matching open in window",
+                 dropped_orphans)
+
+    # Drop trades where net quantity across the window is negative
+    trades, negative_symbols, negative_isins, dropped_negative = filter_net_negative_positions(trades)
+    if dropped_negative:
+        log.info("Dropped %d trade(s) with net negative position in window", dropped_negative)
+
+    # Combined skip sets for dividend filtering
+    skip_symbols = orphaned_symbols | negative_symbols
+    skip_isins = orphaned_isins | negative_isins
 
     # Get existing orders to avoid duplicates
     existing_trade_ids, existing_dividend_comments = ghost_get_existing_orders(config)
@@ -492,6 +649,12 @@ def process_account(config, ibkr_account_id, query_id, ghost_account_name, mappi
     div_skipped_dup = 0
 
     for div in dividends:
+        div_symbol = div.get("symbol", "")
+        div_isin = div.get("isin", "")
+        if div_symbol in skip_symbols or (div_isin and div_isin in skip_isins):
+            log.debug("Skipping dividend for %s - position was fully closed (orphaned)", div_symbol)
+            continue
+
         activity = convert_dividend_to_activity(div, ghost_account_id, mapping, unmapped)
         if activity:
             if activity["comment"] in existing_dividend_comments:
@@ -510,17 +673,11 @@ def process_account(config, ibkr_account_id, query_id, ghost_account_name, mappi
 
     # Update cash balance
     try:
-        cash_balances = parse_cash_report(xml_text)
-        base_currency = parse_base_currency(xml_text)
-        if base_currency in cash_balances:
-            ghost_update_cash_balance(config, ghost_account_id, cash_balances[base_currency])
-        elif cash_balances:
-            # Use the first available currency balance
-            first_currency = next(iter(cash_balances))
-            log.info("Base currency %s not in cash report, using %s", base_currency, first_currency)
-            ghost_update_cash_balance(config, ghost_account_id, cash_balances[first_currency])
+        cash_balance = parse_cash_report(xml_text)
+        if cash_balance is not None:
+            ghost_update_cash_balance(config, ghost_account_id, cash_balance)
         else:
-            log.info("No cash balance data found in report")
+            log.info("No BASE_SUMMARY cash balance found in report")
     except Exception as exc:
         log.error("Failed to update cash balance: %s", exc)
 
@@ -560,6 +717,8 @@ def main():
             desc = info.get("description", "")
             print(f"  {isin}: ???  # IBKR symbol: {symbol}, description: {desc}")
         print("=" * 60 + "\n")
+    else:
+        log.info("All ISINs resolved via mapping or symbol fallback")
 
     log.info("Sync complete")
 
