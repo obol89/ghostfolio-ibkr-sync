@@ -553,7 +553,7 @@ def filter_net_negative_positions(trades):
         if not group_info[key]["symbol"]:
             group_info[key]["symbol"] = symbol
 
-    negative_keys = {key for key, info in group_info.items() if info["net_qty"] < 0}
+    negative_keys = {key for key, info in group_info.items() if info["net_qty"] < -0.001}
 
     negative_symbols = set()
     negative_isins = set()
