@@ -123,15 +123,19 @@ Activity Statement data updates once daily after market close. Running the sync 
 
 ## Ghostfolio Setup
 
-### 1. Get an auth token
+### 1. Get your security token
+
+Copy the **security token** shown in the Ghostfolio UI (the one you use to sign in) and set it as `GHOST_SECURITY_TOKEN`. At startup the tool exchanges it once for a fresh JWT via `POST /api/v1/auth/anonymous` and uses that JWT for the rest of the run, so there is nothing to renew.
+
+To check the security token before deploying (prints only the HTTP status: `200`/`201` means it works, `403` means it was rejected):
 
 ```bash
-curl -X POST http://localhost:3333/api/v1/auth/anonymous \
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:3333/api/v1/auth/anonymous \
   -H 'Content-Type: application/json' \
-  -d '{"accessToken": "YOUR_GHOSTFOLIO_ACCESS_TOKEN"}'
+  -d '{"accessToken": "YOUR_GHOSTFOLIO_SECURITY_TOKEN"}'
 ```
 
-The response contains an `authToken` field. Use this as `GHOST_TOKEN`. This token expires and will need to be regenerated periodically.
+`GHOST_TOKEN` (a pre-exchanged JWT) is still accepted when `GHOST_SECURITY_TOKEN` is unset, but Ghostfolio signs those JWTs for 180 days, after which every run fails with `401 Unauthorized`. The tool logs a warning with the expiry date on every run that uses it.
 
 ### 2. Create an IBKR Platform
 
@@ -146,6 +150,8 @@ To find the Platform ID, query the API:
 curl http://localhost:3333/api/v1/platform \
   -H 'Authorization: Bearer YOUR_AUTH_TOKEN'
 ```
+
+`YOUR_AUTH_TOKEN` is the `authToken` field returned by the `/api/v1/auth/anonymous` call above (run it without the `-s -o /dev/null -w` flags to see the body).
 
 Look for the `id` field of the IBKR platform entry. Use this as `GHOST_PLATFORM_ID`.
 
@@ -180,7 +186,8 @@ All configuration is done via environment variables:
 | `IBKR_TOKEN` | Yes | IBKR Flex Web Service token | `1234567890abcdef` |
 | `IBKR_ACCOUNT_IDS` | Yes | Comma-separated IBKR account IDs | `U1234567` |
 | `IBKR_QUERY_IDS` | Yes | Comma-separated Flex Query IDs (one per account) | `123456` |
-| `GHOST_TOKEN` | Yes | Ghostfolio auth bearer token | `eyJhbGciOi...` |
+| `GHOST_SECURITY_TOKEN` | Yes* | Ghostfolio security token from the UI; exchanged for a fresh JWT each run | `a1b2c3...` |
+| `GHOST_TOKEN` | Yes* | Legacy: a pre-exchanged JWT used as-is. Expires after 180 days; ignored when `GHOST_SECURITY_TOKEN` is set | `eyJhbGciOi...` |
 | `GHOST_HOST` | Yes | Ghostfolio base URL | `http://ghostfolio:3333` |
 | `GHOST_CURRENCY` | No | Default currency (default: `USD`) | `EUR` |
 | `GHOST_PLATFORM_ID` | No | Platform ID for IBKR in Ghostfolio | `abc123-def456` |
@@ -188,6 +195,8 @@ All configuration is done via environment variables:
 | `MAPPING_FILE` | No | Path to symbol mapping YAML (default: `mapping.yaml`) | `/app/mapping.yaml` |
 | `CRON` | No | Cron schedule for recurring runs (Docker only) | `0 6 * * *` |
 | `TZ` | No | Timezone for cron scheduling | `Europe/Warsaw` |
+
+\* Set one of `GHOST_SECURITY_TOKEN` (recommended) or `GHOST_TOKEN`. The run exits 1 if neither is set.
 
 ## Mapping File
 
@@ -255,7 +264,7 @@ docker run --rm \
   -e IBKR_TOKEN=your_token \
   -e IBKR_ACCOUNT_IDS=U1234567 \
   -e IBKR_QUERY_IDS=123456 \
-  -e GHOST_TOKEN=your_ghost_token \
+  -e GHOST_SECURITY_TOKEN=your_ghost_security_token \
   -e GHOST_HOST=http://ghostfolio:3333 \
   -e GHOST_ACCOUNT_NAMES="IBKR Main" \
   -v ./mapping.yaml:/app/mapping.yaml \
@@ -269,7 +278,7 @@ pip install -r requirements.txt
 export IBKR_TOKEN=your_token
 export IBKR_ACCOUNT_IDS=U1234567
 export IBKR_QUERY_IDS=123456
-export GHOST_TOKEN=your_ghost_token
+export GHOST_SECURITY_TOKEN=your_ghost_security_token
 export GHOST_HOST=http://localhost:3333
 export GHOST_ACCOUNT_NAMES="IBKR Main"
 python ibkr_to_ghostfolio.py
@@ -292,7 +301,7 @@ services:
       IBKR_TOKEN: your_token
       IBKR_ACCOUNT_IDS: U1234567
       IBKR_QUERY_IDS: 123456
-      GHOST_TOKEN: your_ghost_token
+      GHOST_SECURITY_TOKEN: your_ghost_security_token
       GHOST_HOST: http://ghostfolio:3333
       GHOST_ACCOUNT_NAMES: "IBKR Individual"
       MAPPING_FILE: /app/mapping.yaml
@@ -313,7 +322,7 @@ services:
       IBKR_TOKEN: your_token
       IBKR_ACCOUNT_IDS: U7654321
       IBKR_QUERY_IDS: 654321
-      GHOST_TOKEN: your_ghost_token
+      GHOST_SECURITY_TOKEN: your_ghost_security_token
       GHOST_HOST: http://ghostfolio:3333
       GHOST_ACCOUNT_NAMES: "IBKR Joint"
       MAPPING_FILE: /app/mapping.yaml
@@ -359,7 +368,7 @@ The tool logs the error and continues - it still updates the cash balance and st
 | Code | Meaning |
 | --- | --- |
 | 0 | Every account synced cleanly |
-| 1 | Missing or inconsistent configuration, the initial activities fetch failed, at least one account failed, or an unhandled error occurred |
+| 1 | Missing or inconsistent configuration, Ghostfolio authentication failed (security token rejected with 403, or a request still returned 401 after one re-authentication), the initial activities fetch failed, at least one account failed, or an unhandled error occurred |
 
 A run is best-effort: an error on one account is logged and the remaining accounts are still processed, but any failure makes the whole run exit 1. Failures that count include an IBKR Flex Query fetch error, a Ghostfolio account name that does not exist, an import returning 4xx/5xx, and a failed cash balance update.
 
@@ -381,7 +390,9 @@ IBKR sometimes appends a suffix to symbol names for certain listings. The tool f
 
 The IBKR Flex Web Service token expires based on the expiry you set when generating it. Set a calendar reminder before it expires. If the script starts failing with authentication errors, generate a new token in IBKR Account Management.
 
-The Ghostfolio auth token also expires. Regenerate it using the curl command in the Ghostfolio Setup section and update your container environment variable.
+With `GHOST_SECURITY_TOKEN` set, the Ghostfolio JWT is fetched fresh at the start of every run and never needs renewing. If a request returns `401` mid-run, the tool re-authenticates once and retries that request once. `Ghostfolio rejected GHOST_SECURITY_TOKEN (403)` means the security token is wrong or was regenerated in the UI.
+
+If you still use the legacy `GHOST_TOKEN`, it expires 180 days after it was issued and runs then fail with `401 Client Error: Unauthorized`. Each run logs a warning with its expiry date. Switch to `GHOST_SECURITY_TOKEN` to stop this.
 
 ### Options trades being skipped
 
@@ -397,5 +408,5 @@ Also intentional. Trades with assetCategory `CASH` are FX conversion transaction
 - **365-day window** - IBKR Flex Query maximum period is 365 days. Positions opened before that window will not be imported. Fully closed positions older than 365 days are also not imported - this is expected behaviour, not a bug.
 - **Yahoo Finance data quality** - price data can have gaps, delays, or missing metadata (sector, country) for non-US ETFs and smaller listings
 - **Daily data only** - Activity Statements update once daily after market close; intraday syncing is not possible
-- **Token management** - both the IBKR Flex token and the Ghostfolio auth token expire and require manual renewal. Set a recurring calendar reminder for the IBKR token (up to 1 year).
+- **Token management** - the IBKR Flex token expires and requires manual renewal; set a recurring calendar reminder (up to 1 year). The Ghostfolio side needs no renewal when `GHOST_SECURITY_TOKEN` is used.
 - **One container per account** - running multiple sub-accounts requires multiple containers with separate Flex Queries

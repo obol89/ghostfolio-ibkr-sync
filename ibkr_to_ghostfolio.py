@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Sync Interactive Brokers trades and dividends to a self-hosted Ghostfolio instance."""
 
+import base64
+import json
 import logging
 import os
 import sys
@@ -40,11 +42,14 @@ GHOST_PAGE_SIZE = 1000
 
 def load_config():
     """Load and validate configuration from environment variables."""
-    required = ["IBKR_TOKEN", "IBKR_ACCOUNT_IDS", "IBKR_QUERY_IDS",
-                "GHOST_TOKEN", "GHOST_HOST"]
+    required = ["IBKR_TOKEN", "IBKR_ACCOUNT_IDS", "IBKR_QUERY_IDS", "GHOST_HOST"]
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
         log.error("Missing required environment variables: %s", ", ".join(missing))
+        sys.exit(1)
+    if not os.environ.get("GHOST_SECURITY_TOKEN") and not os.environ.get("GHOST_TOKEN"):
+        log.error("Missing Ghostfolio credentials: set GHOST_SECURITY_TOKEN "
+                  "(recommended) or GHOST_TOKEN")
         sys.exit(1)
 
     account_ids = os.environ["IBKR_ACCOUNT_IDS"].split(",")
@@ -63,7 +68,10 @@ def load_config():
         "account_ids": [a.strip() for a in account_ids],
         "query_ids": [q.strip() for q in query_ids],
         "account_names": [n.strip() for n in account_names] if account_names != [""] else [],
-        "ghost_token": os.environ["GHOST_TOKEN"],
+        # Bearer token for every Ghostfolio call; replaced by the exchanged JWT
+        # when ghost_security_token is set
+        "ghost_token": os.environ.get("GHOST_TOKEN", ""),
+        "ghost_security_token": os.environ.get("GHOST_SECURITY_TOKEN", ""),
         "ghost_host": os.environ["GHOST_HOST"].rstrip("/"),
         "ghost_currency": os.environ.get("GHOST_CURRENCY", "USD"),
         "ghost_platform_id": os.environ.get("GHOST_PLATFORM_ID", ""),
@@ -207,6 +215,66 @@ def parse_dividends(xml_text):
 # Ghostfolio API helpers
 # ---------------------------------------------------------------------------
 
+def jwt_expiry(token):
+    """Return the exp claim of a JWT as an aware UTC datetime, or None.
+
+    Only the base64url payload segment is decoded; the signature is not checked.
+    Returns None for anything that is not a JWT carrying a numeric exp.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    payload = parts[1]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return datetime.fromtimestamp(claims["exp"], tz=timezone.utc)
+    except (ValueError, KeyError, TypeError, OverflowError, OSError):
+        return None
+
+
+def ghost_authenticate(config):
+    """Exchange the Ghostfolio security token for a JWT and store it in config.
+
+    The endpoint is rate-limited, so this runs once at startup and again only
+    when a request comes back 401.  Ghostfolio answers 403 to every failed
+    exchange, so a 403 is fatal and not retried.
+    """
+    url = f"{config['ghost_host']}/api/v1/auth/anonymous"
+    resp = requests.post(url, json={"accessToken": config["ghost_security_token"]},
+                         timeout=30)
+    if resp.status_code == 403:
+        log.error("Ghostfolio rejected GHOST_SECURITY_TOKEN (403). Check that it is the "
+                  "security token shown in the Ghostfolio UI and has not been regenerated")
+        sys.exit(1)
+    resp.raise_for_status()
+    auth_token = resp.json().get("authToken")
+    if not auth_token:
+        raise ValueError("Ghostfolio auth response did not contain an authToken")
+    config["ghost_token"] = auth_token
+
+    expiry = jwt_expiry(auth_token)
+    log.info("Authenticated with Ghostfolio, JWT valid until %s",
+             expiry.isoformat() if expiry else "unknown")
+
+
+def warn_static_token_expiry(token, now=None):
+    """Log a WARNING with the expiry of a static GHOST_TOKEN."""
+    expiry = jwt_expiry(token)
+    if expiry is None:
+        log.warning("GHOST_TOKEN is not a decodable JWT, so its expiry is unknown. "
+                    "Set GHOST_SECURITY_TOKEN instead to fetch a fresh JWT every run")
+        return
+    now = now or datetime.now(timezone.utc)
+    if expiry <= now:
+        log.warning("GHOST_TOKEN expired on %s. Set GHOST_SECURITY_TOKEN instead to "
+                    "fetch a fresh JWT every run", expiry.isoformat())
+    else:
+        days_left = int((expiry - now).total_seconds() // 86400)
+        log.warning("GHOST_TOKEN is a static JWT that expires on %s (%d days remaining). "
+                    "Set GHOST_SECURITY_TOKEN instead to fetch a fresh JWT every run",
+                    expiry.isoformat(), days_left)
+
+
 def ghost_headers(token):
     """Return common headers for Ghostfolio API calls."""
     return {
@@ -215,10 +283,32 @@ def ghost_headers(token):
     }
 
 
+def ghost_request(config, method, url, **kwargs):
+    """Send a Ghostfolio API request with the run's bearer token.
+
+    When the JWT came from GHOST_SECURITY_TOKEN, a 401 triggers one
+    re-exchange and one retry of this request; a second 401 ends the run.
+    """
+    resp = requests.request(method, url, headers=ghost_headers(config["ghost_token"]),
+                            **kwargs)
+    if resp.status_code != 401 or not config["ghost_security_token"]:
+        return resp
+
+    log.warning("Ghostfolio returned 401 for %s %s, re-authenticating once", method, url)
+    ghost_authenticate(config)
+    resp = requests.request(method, url, headers=ghost_headers(config["ghost_token"]),
+                            **kwargs)
+    if resp.status_code == 401:
+        log.error("Ghostfolio returned 401 again for %s %s after re-authenticating",
+                  method, url)
+        sys.exit(1)
+    return resp
+
+
 def ghost_get_accounts(config):
     """Fetch all accounts from Ghostfolio."""
     url = f"{config['ghost_host']}/api/v1/account"
-    resp = requests.get(url, headers=ghost_headers(config["ghost_token"]), timeout=30)
+    resp = ghost_request(config, "GET", url, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -250,16 +340,15 @@ def ghost_get_existing_orders(config):
     - dividend_comments: set of full comment strings like "dividend#SPY#2024-01-15"
     """
     url = f"{config['ghost_host']}/api/v1/activities"
-    headers = ghost_headers(config["ghost_token"])
     trade_ids = set()
     dividend_comments = set()
 
     skip = 0
     total = None
     while True:
-        resp = requests.get(url, headers=headers,
-                            params={"skip": skip, "take": GHOST_PAGE_SIZE},
-                            timeout=60)
+        resp = ghost_request(config, "GET", url,
+                             params={"skip": skip, "take": GHOST_PAGE_SIZE},
+                             timeout=60)
         resp.raise_for_status()
         data = resp.json()
         activities = data.get("activities", [])
@@ -297,8 +386,7 @@ def ghost_import_activities(config, activities):
     url = f"{config['ghost_host']}/api/v1/import"
     payload = {"activities": activities}
     try:
-        resp = requests.post(url, headers=ghost_headers(config["ghost_token"]),
-                             json=payload, timeout=60)
+        resp = ghost_request(config, "POST", url, json=payload, timeout=60)
     except requests.RequestException as exc:
         log.error("Import request failed: %s", exc)
         return False
@@ -338,7 +426,7 @@ def ghost_update_cash_balance(config, account_id, balance):
     and removed in 3.39.0, so sending it fails outright on newer instances.
     """
     url = f"{config['ghost_host']}/api/v1/account/{account_id}"
-    resp = requests.get(url, headers=ghost_headers(config["ghost_token"]), timeout=30)
+    resp = ghost_request(config, "GET", url, timeout=30)
     resp.raise_for_status()
     account_data = resp.json()
 
@@ -349,8 +437,7 @@ def ghost_update_cash_balance(config, account_id, balance):
         "name": account_data["name"],
         "platformId": account_data.get("platformId") or config.get("ghost_platform_id") or None,
     }
-    resp = requests.put(url, headers=ghost_headers(config["ghost_token"]),
-                        json=payload, timeout=30)
+    resp = ghost_request(config, "PUT", url, json=payload, timeout=30)
     if resp.status_code >= 400:
         log.error("Failed to update cash balance (%d): %s", resp.status_code, resp.text)
         return False
@@ -772,6 +859,15 @@ def main():
     log.info("Starting IBKR to Ghostfolio sync")
 
     config = load_config()
+    if config["ghost_security_token"]:
+        try:
+            ghost_authenticate(config)
+        except (requests.RequestException, ValueError) as exc:
+            log.error("Failed to authenticate with Ghostfolio: %s", exc)
+            return 1
+    else:
+        warn_static_token_expiry(config["ghost_token"])
+
     mapping = load_mapping(config["mapping_file"])
     log.info("Loaded %d symbol mappings", len(mapping))
 
